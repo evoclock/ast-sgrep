@@ -66,7 +66,7 @@
     "ast-sgrep": ">=2.5.4 <3"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.80.6 <1",
+    "@earendil-works/pi-coding-agent": ">=0.80.6",
     "typebox": "*"
   },
   "peerDependenciesMeta": {
