@@ -262,7 +262,7 @@ const postpublish = async () => {
   for (const artifact of manifest.artifacts) {
     registry[`${artifact.name}@${artifact.version}`] = await publishedMetadata(artifact.name, artifact.version);
   }
-  validatePublishedFamily(state, manifest, registry, await readJson(path.join(root, 'package-lock.json')));
+  validatePublishedFamily(state, manifest, registry, await readJson(path.resolve(option('lockfile', path.join(root, 'package-lock.json')))));
   console.log(`[pi-release] post-publication: ${manifest.artifacts.length} registry artifacts match staged bytes; native lock entries resolve`);
 };
 const registryVersions = async (state, snapshotPath, specs) => {
