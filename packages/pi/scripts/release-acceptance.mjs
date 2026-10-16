@@ -215,6 +215,56 @@ const verify = async (directoryOption) => {
   console.log(`[pi-release] verified ${manifest.artifacts.length} immutable artifacts at ${manifest.version}`);
   return { state, directory, manifest };
 };
+// The pre-publication `verify` proves the staged bytes and file inventory.
+// Post-publication proof additionally binds those exact bytes to the public
+// registry and rejects optional lock entries npm ci can silently skip.
+const validatePublishedFamily = (state, manifest, registry, lock) => {
+  for (const artifact of manifest.artifacts) {
+    const spec = `${artifact.name}@${artifact.version}`;
+    const observed = registry[spec];
+    if (observed?.name !== artifact.name || observed.version !== artifact.version ||
+        !/^sha512-[A-Za-z0-9+/]+=*$/u.test(artifact.integrity ?? '') ||
+        observed.dist?.integrity !== artifact.integrity) fail('ASGREP_RELEASE_PUBLISHED_MISMATCH', spec);
+    const target = state.matrix.targets.find((entry) => entry.package === artifact.name);
+    if ((artifact.layer === 'native') !== Boolean(target)) fail('ASGREP_RELEASE_NATIVE_LOCK_UNRESOLVED', spec);
+    if (!target) continue;
+    if (!observed.dist.tarball?.startsWith(`https://registry.npmjs.org/${artifact.name}/-/`)) fail('ASGREP_RELEASE_REGISTRY', `${spec}: unexpected tarball origin`);
+    const entry = lock.packages?.[`node_modules/${artifact.name}`];
+    if (entry?.version !== artifact.version || entry.optional !== true ||
+        entry.resolved !== observed.dist.tarball || entry.integrity !== artifact.integrity ||
+        JSON.stringify(entry.os) !== JSON.stringify([target.os]) ||
+        JSON.stringify(entry.cpu) !== JSON.stringify([target.cpu]) ||
+        JSON.stringify(entry.libc ?? []) !== JSON.stringify(target.libc ? [target.libc] : [])) {
+      fail('ASGREP_RELEASE_NATIVE_LOCK_UNRESOLVED', spec);
+    }
+  }
+};
+const publishedMetadata = async (name, version) => {
+  const url = `https://registry.npmjs.org/${encodeURIComponent(name)}/${encodeURIComponent(version)}`;
+  const response = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(12_000) });
+  if (!response.ok || !response.body) fail('ASGREP_RELEASE_REGISTRY', `${name}@${version}: HTTP ${response.status}`);
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of response.body) {
+    size += chunk.byteLength;
+    if (size > 131_072) fail('ASGREP_RELEASE_REGISTRY', `${name}@${version}: metadata too large`);
+    chunks.push(chunk);
+  }
+  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+  catch { fail('ASGREP_RELEASE_REGISTRY', `${name}@${version}: malformed metadata`); }
+};
+const postpublish = async () => {
+  const { state, manifest } = await verify();
+  if (manifest.lane === 'extension') fail('ASGREP_RELEASE_POSTPUBLICATION', 'family lane required');
+  // Sequential observations are not an atomic registry snapshot; any mixed
+  // state refuses, and this command never performs a publication side effect.
+  const registry = {};
+  for (const artifact of manifest.artifacts) {
+    registry[`${artifact.name}@${artifact.version}`] = await publishedMetadata(artifact.name, artifact.version);
+  }
+  validatePublishedFamily(state, manifest, registry, await readJson(path.resolve(option('lockfile', path.join(root, 'package-lock.json')))));
+  console.log(`[pi-release] post-publication: ${manifest.artifacts.length} registry artifacts match staged bytes; native lock entries resolve`);
+};
 const registryVersions = async (state, snapshotPath, specs) => {
   if (snapshotPath) return await readJson(path.resolve(snapshotPath));
   const observed = {};
@@ -377,6 +427,23 @@ const selfTest = async () => {
   const approvedEnv = { GITHUB_ACTIONS: 'true', ACTIONS_ID_TOKEN_REQUEST_URL: 'https://actions.example/oidc', ASGREP_NPM_PROTECTED_ENVIRONMENT: 'npm-production', ASGREP_NPM_OWNERSHIP_APPROVED: 'true', GITHUB_REF_TYPE: 'tag', GITHUB_REF_NAME: state.contract.canonicalVersion.tag, GITHUB_SHA: commit };
   validatePublishContext(state, { commit }, approvedEnv);
   expect('ownership-unapproved', () => validatePublishContext(state, { commit }, { ...approvedEnv, ASGREP_NPM_OWNERSHIP_APPROVED: '' }));
+  const integrity = `sha512-${Buffer.alloc(64, 1).toString('base64')}`;
+  const artifacts = packageOrder(state).map((name) => ({ name, version: expectedArtifactVersion(state, name), layer: classify(state, name), integrity }));
+  const staged = { artifacts };
+  const registry = Object.fromEntries(artifacts.map((artifact) => [`${artifact.name}@${artifact.version}`, {
+    name: artifact.name, version: artifact.version,
+    dist: { integrity, tarball: `https://registry.npmjs.org/${artifact.name}/-/${artifact.name.split('/').at(-1)}-${artifact.version}.tgz` }
+  }]));
+  const lock = { packages: Object.fromEntries(state.matrix.targets.map((target) => {
+    const item = registry[`${target.package}@${state.version}`];
+    return [`node_modules/${target.package}`, { version: expectedArtifactVersion(state, target.package), optional: true, os: [target.os], cpu: [target.cpu],
+      ...(target.libc ? { libc: [target.libc] } : {}), resolved: item.dist.tarball, integrity }];
+  })) };
+  validatePublishedFamily(state, staged, registry, lock);
+  expect('published-integrity-mismatch', () => validatePublishedFamily(state, staged, { ...registry, [`${artifacts[0].name}@${artifacts[0].version}`]: { ...registry[`${artifacts[0].name}@${artifacts[0].version}`], dist: { integrity: 'sha512-wrong' } } }, lock));
+  expect('published-native-optional-stub', () => validatePublishedFamily(state, staged, registry, { packages: { ...lock.packages, [`node_modules/${state.matrix.targets[0].package}`]: { version: state.version, optional: true } } }));
+  expect('published-layer-skew', () => validatePublishedFamily(state, { artifacts: [{ ...artifacts[0], layer: 'launcher' }, ...artifacts.slice(1)] }, registry, lock));
+  expect('published-native-not-yet-live', () => validatePublishedFamily(state, staged, { ...registry, [`${artifacts[0].name}@${artifacts[0].version}`]: null }, lock));
   // Extension lane: accepts a fresh signed pi-v<version> tag, rejects skews and duplicates.
   const extInput = { clean: true, refType: 'tag', tag: extensionTag(state), commit, tagCommit: commit };
   const extSpec = `${state.extension.name}@${state.extension.version}`;
@@ -396,8 +463,9 @@ const selfTest = async () => {
 const command = process.argv[2];
 if (command === 'pack') await pack();
 else if (command === 'verify') await verify();
+else if (command === 'postpublish') await postpublish();
 else if (command === 'gate') await gate();
 else if (command === 'publish') await publish();
 else if (command === 'fixture-native') await fixtureNative();
 else if (command === 'self-test') await selfTest();
-else fail('ASGREP_RELEASE_USAGE', 'pack | verify | gate | publish | fixture-native | self-test');
+else fail('ASGREP_RELEASE_USAGE', 'pack | verify | postpublish | gate | publish | fixture-native | self-test');

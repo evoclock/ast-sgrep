@@ -353,6 +353,63 @@ jobs:
           git commit -m "chore(ci): re-pin lockfile after $GITHUB_REF_NAME publication"
           git push origin main
 
+  postpublication-check:
+    name: Verify published family and fresh registry install
+    if: ${{ always() && inputs.publish == true && inputs.layer == 'family' && needs.repin-lock.result == 'success' }}
+    needs: [repin-lock]
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: tagged-release
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          path: pinned-main
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22.19.0
+      - name: Read preserved release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p tagged-release/npm-packs
+          api="repos/${GITHUB_REPOSITORY}/releases"
+          release_id="$(gh api "$api" --jq ".[] | select(.tag_name == \"${{ github.ref_name }}\") | .id" | head -1)"
+          test -n "$release_id" || { echo "release asset not found" >&2; exit 1; }
+          gh api "$api/$release_id/assets" --jq '.[] | [.name, .id] | @tsv' | while IFS=$'\t' read -r name id; do
+            case "$name" in
+              *.tgz|release-manifest.json)
+                gh api -H "Accept: application/octet-stream" "repos/${GITHUB_REPOSITORY}/releases/assets/$id" > "tagged-release/npm-packs/$name"
+                ;;
+            esac
+          done
+      - name: Compare published bytes and pinned native lock entries
+        run: node tagged-release/packages/pi/scripts/release-acceptance.mjs postpublish --artifacts tagged-release/npm-packs --lockfile pinned-main/package-lock.json
+      - name: Require Socket Firewall before fresh registry install
+        run: command -v sfw
+      - name: Install exact published family without credentials or scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          consumer="$RUNNER_TEMP/ast-sgrep-registry-consumer"
+          test ! -e "$consumer"
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP" \
+            npm_config_userconfig="$RUNNER_TEMP/ast-sgrep-empty-user-npmrc" \
+            npm_config_globalconfig="$RUNNER_TEMP/ast-sgrep-empty-global-npmrc" \
+            npm_config_cache="$RUNNER_TEMP/ast-sgrep-public-cache" \
+            npm_config_registry=https://registry.npmjs.org/ \
+            sfw npm install --prefix "$consumer" --no-package-lock --ignore-scripts --no-audit --no-fund \
+            "ast-sgrep@$(node -p "require('./tagged-release/packages/pi/launcher/package.json').version")" \
+            "pi-ast-sgrep@$(node -p "require('./tagged-release/packages/pi/extension/package.json').version")"
+      - name: Exercise registry-installed host-native binary and extension
+        run: node tagged-release/packages/pi/scripts/registry-install-check.mjs --install-root "$RUNNER_TEMP/ast-sgrep-registry-consumer"
+
   extension-gate:
     name: Validate signed extension tag
     if: ${{ inputs.publish == true && inputs.layer == 'extension' && github.ref_type == 'tag' && github.ref_name == inputs.release_tag }}

@@ -120,7 +120,7 @@ report(equal(contract.surface?.cliCommands, ['asgrep', 'ast-sgrep']) && contract
 report(contract.compatibility?.node?.range === '>=22.19.0' && contract.compatibility.node.minimum === '22.19.0', 'Node compatibility floor changed');
 report(contract.compatibility?.pi?.package === '@earendil-works/pi-coding-agent' && contract.compatibility.pi.range === '>=0.80.6 <1' && contract.compatibility.pi.minimum === '0.80.6' && contract.compatibility.pi.api === 'ExtensionAPI', 'Pi compatibility policy changed');
 report(extensionManifest.peerDependencies?.['@earendil-works/pi-coding-agent'] === contract.compatibility?.pi?.range, 'extension Pi peer range drifts from the compatibility contract');
-report(extensionManifest.dependencies?.typebox === '^1.0.0' && extensionManifest.peerDependencies?.typebox === undefined, 'typebox must remain a direct runtime dependency');
+report(extensionManifest.dependencies?.typebox === undefined && extensionManifest.peerDependencies?.typebox === '*', 'typebox must remain a Pi host-provided peer');
 const layers = contract.compatibility?.layers ?? {};
 report(layers.launcher?.version === version && layers.binary?.version === nativeVersion, 'launcher layer or embedded native CLI drifts from its canonical version');
 report(layers.launcher?.compatibility === 'exact' && layers.binary?.compatibility === 'exact-native-cli', 'launcher/binary layer compatibility must reject version skew');
